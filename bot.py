@@ -821,4 +821,8 @@ async def on_ready():
 
 # ================= RUN =================
 
-bot.run(TOKEN)
+while True:
+    try:
+        bot.run(TOKEN)
+    except Exception as e:
+        print("Bot crashed, restarting...", e)

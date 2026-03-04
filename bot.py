@@ -629,7 +629,7 @@ class NoteView(ui.View):
 
 class MenuView(ui.View):
     def __init__(self, owner_id: int):
-        super().__init__(timeout=600)
+        super().__init__(timeout=7200)
         self.owner_id = owner_id
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:

@@ -126,7 +126,7 @@ def format_time(seconds: float):
     hours = int(minutes // 60)
     minutes = minutes % 60
     if hours > 0:
-        return f"{hours} uur {minutes} min"
+        return f"{hours} hours {minutes} min"
     return f"{minutes} min"
 
 def add_elapsed_to_totals(row: dict):
@@ -511,7 +511,7 @@ class GoalView(ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
             await interaction.response.send_message(
-                "Deze knoppen zijn niet voor jou 🙂. Typ `!menu` in je eigen DM met mij.",
+                "These buttons aren't for you 🙂. Please type !menu in your DM with me.",
                 ephemeral=True
             )
             return False

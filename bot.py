@@ -52,7 +52,7 @@ _add_column_if_missing("last_stand_reminder_session_start", "TEXT")  # standing 
 
 # ================= CONFIG =================
 
-GOAL_PRESETS_MIN = {"easy": 30, "medium": 60, "hard": 120}
+GOAL_PRESETS_MIN = {"easy": 30, "medium": 90, "hard": 180}
 
 # Recommended reminder times (you can tweak these)
 RECOMMENDED_SIT_REMINDER_MIN = 30     # remind to stand after sitting
@@ -680,7 +680,7 @@ class MenuView(ui.View):
             content = f"{interaction.user.mention} you don't have a note yet. Click **Edit note** to add one."
         await interaction.message.edit(content=content, view=NoteView(self.owner_id))
 
-    @ui.button(label="End", style=discord.ButtonStyle.danger)
+    @ui.button(label="Pause/End", style=discord.ButtonStyle.danger)
     async def end(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.defer()
         text = await action_end(interaction.user)
@@ -746,8 +746,9 @@ async def end(ctx):
 
 @tasks.loop(minutes=1)
 async def goal_checker():
-    for row in cursor.execute("SELECT user_id FROM users"):
-        user_id = row[0]
+    user_ids = [r[0] for r in cursor.execute("SELECT user_id FROM users").fetchall()]
+
+    for user_id in user_ids:
         data = get_user(user_id)
         if not data:
             continue
@@ -765,10 +766,12 @@ async def goal_checker():
             except discord.Forbidden:
                 print(f"Could not DM user {user_id} (DMs disabled).")
 
+
 @tasks.loop(minutes=1)
 async def reminder_checker():
-    for row in cursor.execute("SELECT user_id FROM users"):
-        user_id = row[0]
+    user_ids = [r[0] for r in cursor.execute("SELECT user_id FROM users").fetchall()]
+
+    for user_id in user_ids:
         data = get_user(user_id)
         if not data:
             continue
@@ -810,7 +813,6 @@ async def reminder_checker():
                         )
                     except discord.Forbidden:
                         print(f"Could not DM user {user_id} (DMs disabled).")
-
 @bot.event
 async def on_ready():
     print("Bot ready")

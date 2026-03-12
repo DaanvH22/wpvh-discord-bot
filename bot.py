@@ -1,7 +1,8 @@
 import discord
 from discord.ext import commands, tasks
 from discord import ui
-from datetime import datetime, date
+from datetime import datetime, date, timedelta, time
+from zoneinfo import ZoneInfo
 import sqlite3
 import os
 from dotenv import load_dotenv
@@ -16,6 +17,22 @@ if RAILWAY_VOLUME_MOUNT_PATH:
     DB_PATH = os.path.join(RAILWAY_VOLUME_MOUNT_PATH, "standbot.db")
 else:
     DB_PATH = "standbot.db"
+
+# ================= TIMEZONE =================
+
+APP_TIMEZONE = ZoneInfo("Europe/Amsterdam")
+
+
+def local_now() -> datetime:
+    # Store local Amsterdam time as naive datetime to stay compatible with existing DB rows
+    return datetime.now(APP_TIMEZONE).replace(tzinfo=None)
+
+
+def local_today() -> date:
+    return local_now().date()
+
+
+# ================= DISCORD =================
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -64,6 +81,50 @@ _add_column_if_missing("goal_set_today", "INTEGER")
 _add_column_if_missing("current_streak", "INTEGER")
 _add_column_if_missing("missed_goal_count", "INTEGER")
 _add_column_if_missing("streak_day_processed", "TEXT")
+_add_column_if_missing("streak_awarded_today", "INTEGER")
+
+# Daily extra metrics
+_add_column_if_missing("total_switches_today", "INTEGER")
+_add_column_if_missing("active_today", "INTEGER")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS notes (
+    user_id INTEGER PRIMARY KEY,
+    note TEXT
+)
+""")
+conn.commit()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS daily_metrics (
+    user_id INTEGER,
+    metric_date TEXT,
+    standing_sec REAL,
+    goal_reached INTEGER,
+    switches INTEGER,
+    active INTEGER,
+    PRIMARY KEY (user_id, metric_date)
+)
+""")
+conn.commit()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS group_challenges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    week_start_date TEXT,
+    week_end_date TEXT,
+    challenge_type TEXT,
+    target_value REAL,
+    current_progress REAL,
+    final_progress REAL,
+    channel_id INTEGER,
+    message_id INTEGER,
+    milestone_posted INTEGER,
+    completed INTEGER,
+    completion_message_sent INTEGER
+)
+""")
+conn.commit()
 
 # ================= CONFIG =================
 
@@ -84,58 +145,86 @@ STREAK_RESET_MESSAGE = (
     "Set a goal and reach it again to start a new streak."
 )
 
+CHALLENGE_CHANNEL_ID = 1481603472867721318
+CHALLENGE_START_WEEKDAY = 2  # Wednesday (Mon=0)
+CHALLENGE_START_TIME = time(9, 30)
+CHALLENGE_MILESTONE_STEP = 10
+CHALLENGE_GROWTH_FACTOR = 1.10
+CHALLENGE_HISTORY_WEEKS = 3
+
+CHALLENGE_ROTATION = [
+    "standing_time",
+    "daily_goals",
+    "posture_switches",
+    "active_days"
+]
+
+CHALLENGE_CONFIG = {
+    "standing_time": {
+        "label": "Standing time",
+        "default": 8 * 3600,
+        "min": 4 * 3600,
+        "max": 24 * 3600,
+        "active_threshold": 1 * 3600,
+        "round_to": 1800
+    },
+    "daily_goals": {
+        "label": "Daily goals",
+        "default": 8,
+        "min": 4,
+        "max": 30,
+        "active_threshold": 2,
+        "round_to": 1
+    },
+    "posture_switches": {
+        "label": "Posture switches",
+        "default": 40,
+        "min": 15,
+        "max": 250,
+        "active_threshold": 10,
+        "round_to": 5
+    },
+    "active_days": {
+        "label": "Active days",
+        "default": 8,
+        "min": 4,
+        "max": 30,
+        "active_threshold": 2,
+        "round_to": 1
+    }
+}
+
 # ================= HELPERS =================
 
 def ensure_today(user_id: int):
     """
-    Ensures the user exists and has data for today.
-    Note:
-    - The actual 'end of day' streak logic is handled by daily_rollover_checker().
-    - This function is only a safety net reset in case a user record is still on an old day.
+    Only ensures the user exists.
+    Does NOT reset anything, so a deploy/push will not reset users.
     """
-    today = str(date.today())
-    cursor.execute("SELECT last_reset FROM users WHERE user_id=?", (user_id,))
+    cursor.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
     row = cursor.fetchone()
 
     if row is None:
-        now = datetime.now().isoformat()
+        today = str(local_today())
+        now = local_now().isoformat()
         cursor.execute("""
             INSERT INTO users (
                 user_id,total_standing,total_seated,prev_timestamp,status,
                 daily_goal_sec,daily_goal_reached,last_reset,
                 reminder_sec,reminder_enabled,last_reminder_session_start,
                 reminder_stand_sec,reminder_stand_enabled,last_stand_reminder_session_start,
-                goal_set_today,current_streak,missed_goal_count,streak_day_processed
+                goal_set_today,current_streak,missed_goal_count,streak_day_processed,
+                streak_awarded_today,total_switches_today,active_today
             )
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             user_id, 0, 0, now, "inactive",
             None, 0, today,
             None, 0, None,
             None, 0, None,
-            0, 0, 0, None
+            0, 0, 0, None,
+            0, 0, 0
         ))
-        conn.commit()
-
-    elif row[0] != today:
-        # Safety reset if rollover checker has not processed yet.
-        # We do NOT apply streak penalties here to avoid double-processing.
-        # The intended flow is that daily_rollover_checker handles streak outcomes.
-        now = datetime.now().isoformat()
-        cursor.execute("""
-            UPDATE users SET
-                total_standing=0,
-                total_seated=0,
-                daily_goal_reached=0,
-                goal_set_today=0,
-                streak_day_processed=NULL,
-                status='inactive',
-                prev_timestamp=?,
-                last_reminder_session_start=NULL,
-                last_stand_reminder_session_start=NULL,
-                last_reset=?
-            WHERE user_id=?
-        """, (now, today, user_id))
         conn.commit()
 
 
@@ -160,6 +249,10 @@ def get_user(user_id: int):
     data.setdefault("current_streak", 0)
     data.setdefault("missed_goal_count", 0)
     data.setdefault("streak_day_processed", None)
+    data.setdefault("streak_awarded_today", 0)
+
+    data.setdefault("total_switches_today", 0)
+    data.setdefault("active_today", 0)
 
     return data
 
@@ -173,6 +266,11 @@ def upsert_user(user_id: int, **kwargs):
     conn.commit()
 
 
+def mark_user_active(user_id: int):
+    ensure_today(user_id)
+    upsert_user(user_id, active_today=1)
+
+
 def format_time(seconds: float):
     seconds = max(0, int(seconds))
     minutes = int(seconds // 60)
@@ -184,9 +282,12 @@ def format_time(seconds: float):
 
 
 def add_elapsed_to_totals(row: dict):
-    now = datetime.now()
+    return add_elapsed_to_totals_until(row, local_now())
+
+
+def add_elapsed_to_totals_until(row: dict, until_dt: datetime):
     prev = datetime.fromisoformat(row["prev_timestamp"])
-    elapsed = (now - prev).total_seconds()
+    elapsed = max(0, (until_dt - prev).total_seconds())
 
     standing = float(row["total_standing"] or 0)
     seated = float(row["total_seated"] or 0)
@@ -203,13 +304,24 @@ def set_daily_goal(user_id: int, minutes: int):
     minutes = int(minutes)
     if minutes <= 0:
         raise ValueError("minutes must be > 0")
+
     ensure_today(user_id)
-    upsert_user(
-        user_id,
-        daily_goal_sec=minutes * 60,
-        daily_goal_reached=0,
-        goal_set_today=1
-    )
+    mark_user_active(user_id)
+
+    row = get_user(user_id)
+    streak_already_awarded = int(row.get("streak_awarded_today") or 0) == 1
+
+    update_data = {
+        "daily_goal_sec": minutes * 60,
+        "goal_set_today": 1
+    }
+
+    # If streak already awarded today, do NOT set daily_goal_reached back to 0,
+    # otherwise the streak can be awarded twice.
+    if not streak_already_awarded:
+        update_data["daily_goal_reached"] = 0
+
+    upsert_user(user_id, **update_data)
 
 
 def set_sit_reminder(user_id: int, minutes: int):
@@ -217,6 +329,7 @@ def set_sit_reminder(user_id: int, minutes: int):
     if minutes <= 0:
         raise ValueError("minutes must be > 0")
     ensure_today(user_id)
+    mark_user_active(user_id)
     upsert_user(
         user_id,
         reminder_sec=minutes * 60,
@@ -230,6 +343,7 @@ def set_stand_reminder(user_id: int, minutes: int):
     if minutes <= 0:
         raise ValueError("minutes must be > 0")
     ensure_today(user_id)
+    mark_user_active(user_id)
     upsert_user(
         user_id,
         reminder_stand_sec=minutes * 60,
@@ -240,11 +354,13 @@ def set_stand_reminder(user_id: int, minutes: int):
 
 def disable_sit_reminder(user_id: int):
     ensure_today(user_id)
+    mark_user_active(user_id)
     upsert_user(user_id, reminder_enabled=0, last_reminder_session_start=None)
 
 
 def disable_stand_reminder(user_id: int):
     ensure_today(user_id)
+    mark_user_active(user_id)
     upsert_user(user_id, reminder_stand_enabled=0, last_stand_reminder_session_start=None)
 
 
@@ -253,13 +369,614 @@ def get_streak_text(row: dict) -> str:
     return f"🔥 **Streak:** {streak}"
 
 
+def get_note(user_id: int) -> str | None:
+    cursor.execute("SELECT note FROM notes WHERE user_id=?", (user_id,))
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+
+def set_note(user_id: int, note: str):
+    cursor.execute("""
+    INSERT INTO notes (user_id, note) VALUES (?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET note=excluded.note
+    """, (user_id, note))
+    conn.commit()
+
+
+def save_daily_metrics(user_id: int, metric_date: str, standing_sec: float, goal_reached: int, switches: int, active: int):
+    cursor.execute("""
+    INSERT INTO daily_metrics (user_id, metric_date, standing_sec, goal_reached, switches, active)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(user_id, metric_date) DO UPDATE SET
+        standing_sec=excluded.standing_sec,
+        goal_reached=excluded.goal_reached,
+        switches=excluded.switches,
+        active=excluded.active
+    """, (user_id, metric_date, standing_sec, goal_reached, switches, active))
+    conn.commit()
+
+
+def get_current_challenge_window(now: datetime | None = None):
+    """
+    Returns (start_dt, end_dt_exclusive) for the current challenge window.
+    Challenge starts every Wednesday at 09:30 local time.
+    """
+    if now is None:
+        now = local_now()
+
+    days_since_wed = (now.weekday() - CHALLENGE_START_WEEKDAY) % 7
+    this_wed_date = now.date() - timedelta(days=days_since_wed)
+    this_wed_start = datetime.combine(this_wed_date, CHALLENGE_START_TIME)
+
+    if now < this_wed_start:
+        start_dt = this_wed_start - timedelta(days=7)
+    else:
+        start_dt = this_wed_start
+
+    end_dt = start_dt + timedelta(days=7)
+    return start_dt, end_dt
+
+
+def get_period_dates_from_window(start_dt: datetime, end_dt: datetime):
+    """
+    For metric aggregation we use date-based storage.
+    End date is inclusive Tuesday.
+    """
+    return start_dt.date(), (end_dt - timedelta(days=1)).date()
+
+
+def get_challenge_display_period(start_dt: datetime, end_dt: datetime) -> str:
+    end_display = end_dt - timedelta(minutes=1)
+    return f"{start_dt.strftime('%a %d %b %H:%M')} – {end_display.strftime('%a %d %b %H:%M')}"
+
+
+def get_metric_value_text(challenge_type: str, value: float) -> str:
+    if challenge_type == "standing_time":
+        return format_time(value)
+    if challenge_type == "daily_goals":
+        return f"{int(round(value))} goals"
+    if challenge_type == "posture_switches":
+        return f"{int(round(value))} switches"
+    if challenge_type == "active_days":
+        return f"{int(round(value))} active days"
+    return str(value)
+
+
+def get_milestone_message(percent: int) -> str:
+    if percent >= 100:
+        return "Challenge completed! 🎉"
+    if percent >= 90:
+        return "Final push! 🚀"
+    if percent >= 70:
+        return "Almost there! 👀"
+    if percent >= 50:
+        return "You're halfway there! 🔥"
+    if percent >= 30:
+        return "Good progress so far! 🔥"
+    if percent >= 10:
+        return "Nice start! 💪"
+    return "Let's do this! 💪"
+
+
+def get_next_challenge_type() -> str:
+    cursor.execute("""
+    SELECT challenge_type
+    FROM group_challenges
+    ORDER BY week_start_date DESC, id DESC
+    LIMIT 1
+    """)
+    row = cursor.fetchone()
+
+    if not row:
+        return CHALLENGE_ROTATION[0]
+
+    last_type = row[0]
+    try:
+        idx = CHALLENGE_ROTATION.index(last_type)
+        return CHALLENGE_ROTATION[(idx + 1) % len(CHALLENGE_ROTATION)]
+    except ValueError:
+        return CHALLENGE_ROTATION[0]
+
+
+def round_metric_target(challenge_type: str, raw_value: float) -> float:
+    cfg = CHALLENGE_CONFIG[challenge_type]
+    step = cfg["round_to"]
+    if step <= 1:
+        return int(round(raw_value))
+    return int(round(raw_value / step) * step)
+
+
+def clamp_metric_target(challenge_type: str, value: float) -> float:
+    cfg = CHALLENGE_CONFIG[challenge_type]
+    return max(cfg["min"], min(cfg["max"], value))
+
+
+def compute_challenge_progress(challenge_type: str, week_start_date: date, week_end_date: date, include_live_current: bool = True) -> float:
+    start_str = str(week_start_date)
+    end_str = str(week_end_date)
+
+    column_map = {
+        "standing_time": "standing_sec",
+        "daily_goals": "goal_reached",
+        "posture_switches": "switches",
+        "active_days": "active"
+    }
+
+    col = column_map[challenge_type]
+    cursor.execute(f"""
+    SELECT COALESCE(SUM({col}), 0)
+    FROM daily_metrics
+    WHERE metric_date >= ? AND metric_date <= ?
+    """, (start_str, end_str))
+    db_total = float(cursor.fetchone()[0] or 0)
+
+    if not include_live_current:
+        return db_total
+
+    today = local_today()
+    if not (week_start_date <= today <= week_end_date):
+        return db_total
+
+    live_total = 0.0
+    user_ids = [r[0] for r in cursor.execute("SELECT user_id FROM users").fetchall()]
+    for user_id in user_ids:
+        data = get_user(user_id)
+        if not data:
+            continue
+        if data.get("last_reset") != str(today):
+            continue
+
+        if challenge_type == "standing_time":
+            standing, _, _ = add_elapsed_to_totals(data)
+            live_total += float(standing or 0)
+        elif challenge_type == "daily_goals":
+            live_total += int(data.get("daily_goal_reached") or 0)
+        elif challenge_type == "posture_switches":
+            live_total += int(data.get("total_switches_today") or 0)
+        elif challenge_type == "active_days":
+            live_total += int(data.get("active_today") or 0)
+
+    return db_total + live_total
+
+
+def get_recent_active_week_values(challenge_type: str, limit: int = CHALLENGE_HISTORY_WEEKS) -> list[float]:
+    threshold = CHALLENGE_CONFIG[challenge_type]["active_threshold"]
+
+    cursor.execute("""
+    SELECT week_start_date, week_end_date, final_progress
+    FROM group_challenges
+    WHERE challenge_type=?
+    ORDER BY week_start_date DESC, id DESC
+    """, (challenge_type,))
+    rows = cursor.fetchall()
+
+    values = []
+    for week_start_str, week_end_str, final_progress in rows:
+        if final_progress is None:
+            value = compute_challenge_progress(
+                challenge_type,
+                date.fromisoformat(week_start_str),
+                date.fromisoformat(week_end_str),
+                include_live_current=False
+            )
+        else:
+            value = float(final_progress)
+
+        if value >= threshold:
+            values.append(value)
+
+        if len(values) >= limit:
+            break
+
+    return values
+
+
+def calculate_new_challenge_target(challenge_type: str) -> float:
+    cfg = CHALLENGE_CONFIG[challenge_type]
+    values = get_recent_active_week_values(challenge_type)
+
+    if values:
+        avg = sum(values) / len(values)
+        raw_target = avg * CHALLENGE_GROWTH_FACTOR
+    else:
+        raw_target = cfg["default"]
+
+    rounded = round_metric_target(challenge_type, raw_target)
+    return clamp_metric_target(challenge_type, rounded)
+
+
+async def get_channel_async(channel_id: int):
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except Exception:
+            return None
+    return channel
+
+
+def challenge_row_to_dict(row):
+    if row is None:
+        return None
+    cols = [
+        "id", "week_start_date", "week_end_date", "challenge_type", "target_value",
+        "current_progress", "final_progress", "channel_id", "message_id",
+        "milestone_posted", "completed", "completion_message_sent"
+    ]
+    return dict(zip(cols, row))
+
+
+def get_current_challenge_row():
+    start_dt, end_dt = get_current_challenge_window()
+    week_start_date, week_end_date = get_period_dates_from_window(start_dt, end_dt)
+
+    cursor.execute("""
+    SELECT id, week_start_date, week_end_date, challenge_type, target_value,
+           current_progress, final_progress, channel_id, message_id,
+           milestone_posted, completed, completion_message_sent
+    FROM group_challenges
+    WHERE week_start_date=? AND week_end_date=?
+    ORDER BY id DESC
+    LIMIT 1
+    """, (str(week_start_date), str(week_end_date)))
+
+    return challenge_row_to_dict(cursor.fetchone())
+
+
+def update_group_challenge_row(challenge_id: int, **kwargs):
+    if not kwargs:
+        return
+    fields = ", ".join([f"{k}=?" for k in kwargs.keys()])
+    values = list(kwargs.values()) + [challenge_id]
+    cursor.execute(f"UPDATE group_challenges SET {fields} WHERE id=?", values)
+    conn.commit()
+
+
+def create_group_challenge_row(week_start_date: str, week_end_date: str, challenge_type: str, target_value: float, channel_id: int):
+    cursor.execute("""
+    INSERT INTO group_challenges (
+        week_start_date, week_end_date, challenge_type, target_value,
+        current_progress, final_progress, channel_id, message_id,
+        milestone_posted, completed, completion_message_sent
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        week_start_date, week_end_date, challenge_type, target_value,
+        0, None, channel_id, None,
+        0, 0, 0
+    ))
+    conn.commit()
+    return cursor.lastrowid
+
+
+def build_challenge_message_content(challenge_type: str, target_value: float, progress_value: float, start_dt: datetime, end_dt: datetime) -> str:
+    percent = int((progress_value / target_value) * 100) if target_value > 0 else 0
+    percent = min(100, max(0, percent))
+    label = CHALLENGE_CONFIG[challenge_type]["label"]
+    progress_text = get_metric_value_text(challenge_type, progress_value)
+    target_text = get_metric_value_text(challenge_type, target_value)
+    period_text = get_challenge_display_period(start_dt, end_dt)
+    motivation = get_milestone_message(percent)
+
+    return (
+        f"🏆 **Weekly Group Challenge**\n\n"
+        f"**Type:** {label}\n"
+        f"**Goal:** {target_text} together this week\n"
+        f"**Period:** {period_text}\n\n"
+        f"**Progress:** {progress_text} / {target_text}\n"
+        f"**Completed:** {percent}%\n\n"
+        f"{motivation}"
+    )
+
+
+async def ensure_challenge_message(row: dict):
+    channel = await get_channel_async(int(row["channel_id"]))
+    if channel is None:
+        print(f"Could not find challenge channel {row['channel_id']}.")
+        return row
+
+    start_dt, end_dt = get_current_challenge_window()
+    progress = compute_challenge_progress(
+        row["challenge_type"],
+        date.fromisoformat(row["week_start_date"]),
+        date.fromisoformat(row["week_end_date"]),
+        include_live_current=True
+    )
+
+    content = build_challenge_message_content(
+        row["challenge_type"],
+        float(row["target_value"]),
+        float(progress),
+        start_dt,
+        end_dt
+    )
+
+    message_id = row.get("message_id")
+    if message_id:
+        try:
+            await channel.fetch_message(int(message_id))
+            return row
+        except Exception:
+            pass
+
+    try:
+        message = await channel.send(content)
+        update_group_challenge_row(
+            row["id"],
+            message_id=message.id,
+            current_progress=progress
+        )
+        row["message_id"] = message.id
+        row["current_progress"] = progress
+    except Exception as e:
+        print(f"Could not send challenge message: {e}")
+
+    return row
+
+
+async def edit_challenge_message(row: dict, progress_value: float):
+    channel = await get_channel_async(int(row["channel_id"]))
+    if channel is None:
+        print(f"Could not find challenge channel {row['channel_id']}.")
+        return
+
+    if not row.get("message_id"):
+        return
+
+    try:
+        message = await channel.fetch_message(int(row["message_id"]))
+    except Exception:
+        row = await ensure_challenge_message(row)
+        if not row.get("message_id"):
+            return
+        try:
+            message = await channel.fetch_message(int(row["message_id"]))
+        except Exception:
+            return
+
+    start_dt, end_dt = get_current_challenge_window()
+    content = build_challenge_message_content(
+        row["challenge_type"],
+        float(row["target_value"]),
+        float(progress_value),
+        start_dt,
+        end_dt
+    )
+
+    try:
+        await message.edit(content=content)
+    except Exception as e:
+        print(f"Could not edit challenge message: {e}")
+
+
+async def post_challenge_completion_message(row: dict, progress_value: float):
+    channel = await get_channel_async(int(row["channel_id"]))
+    if channel is None:
+        print(f"Could not find challenge channel {row['channel_id']}.")
+        return
+
+    label = CHALLENGE_CONFIG[row["challenge_type"]]["label"]
+    progress_text = get_metric_value_text(row["challenge_type"], progress_value)
+
+    try:
+        await channel.send(
+            f"🎉 **Weekly Group Challenge completed!**\n\n"
+            f"You completed this week's **{label.lower()}** challenge.\n"
+            f"Final progress: **{progress_text}**\n\n"
+            f"Amazing job everyone! 👏"
+        )
+    except Exception as e:
+        print(f"Could not send challenge completion message: {e}")
+
+
+async def finalize_old_challenges():
+    current = get_current_challenge_row()
+    current_start = None
+    if current:
+        current_start = current["week_start_date"]
+
+    cursor.execute("""
+    SELECT id, week_start_date, week_end_date, challenge_type, target_value,
+           current_progress, final_progress, channel_id, message_id,
+           milestone_posted, completed, completion_message_sent
+    FROM group_challenges
+    ORDER BY week_start_date DESC, id DESC
+    """)
+    rows = cursor.fetchall()
+
+    for raw in rows:
+        row = challenge_row_to_dict(raw)
+        if current_start is not None and row["week_start_date"] == current_start:
+            continue
+        if row["final_progress"] is not None:
+            continue
+
+        final_progress = compute_challenge_progress(
+            row["challenge_type"],
+            date.fromisoformat(row["week_start_date"]),
+            date.fromisoformat(row["week_end_date"]),
+            include_live_current=False
+        )
+        completed = 1 if final_progress >= float(row["target_value"]) else 0
+        update_group_challenge_row(
+            row["id"],
+            final_progress=final_progress,
+            current_progress=final_progress,
+            completed=completed
+        )
+
+
+async def ensure_current_group_challenge():
+    await finalize_old_challenges()
+
+    start_dt, end_dt = get_current_challenge_window()
+    week_start_date, week_end_date = get_period_dates_from_window(start_dt, end_dt)
+
+    row = get_current_challenge_row()
+    if row:
+        return await ensure_challenge_message(row)
+
+    challenge_type = get_next_challenge_type()
+    target_value = calculate_new_challenge_target(challenge_type)
+    challenge_id = create_group_challenge_row(
+        str(week_start_date),
+        str(week_end_date),
+        challenge_type,
+        target_value,
+        CHALLENGE_CHANNEL_ID
+    )
+
+    cursor.execute("""
+    SELECT id, week_start_date, week_end_date, challenge_type, target_value,
+           current_progress, final_progress, channel_id, message_id,
+           milestone_posted, completed, completion_message_sent
+    FROM group_challenges
+    WHERE id=?
+    """, (challenge_id,))
+    row = challenge_row_to_dict(cursor.fetchone())
+    return await ensure_challenge_message(row)
+
+
+async def process_group_challenge():
+    row = await ensure_current_group_challenge()
+    if not row:
+        return
+
+    progress = compute_challenge_progress(
+        row["challenge_type"],
+        date.fromisoformat(row["week_start_date"]),
+        date.fromisoformat(row["week_end_date"]),
+        include_live_current=True
+    )
+
+    target = float(row["target_value"] or 0)
+    percent = int((progress / target) * 100) if target > 0 else 0
+    percent = min(100, max(0, percent))
+    milestone = (percent // CHALLENGE_MILESTONE_STEP) * CHALLENGE_MILESTONE_STEP
+
+    updates = {"current_progress": progress}
+
+    if int(row.get("completed") or 0) == 0 and progress >= target:
+        updates["completed"] = 1
+        updates["final_progress"] = progress
+        updates["milestone_posted"] = 100
+        update_group_challenge_row(row["id"], **updates)
+        row.update(updates)
+
+        await edit_challenge_message(row, progress)
+
+        if int(row.get("completion_message_sent") or 0) == 0:
+            await post_challenge_completion_message(row, progress)
+            update_group_challenge_row(row["id"], completion_message_sent=1)
+        return
+
+    if milestone > int(row.get("milestone_posted") or 0):
+        updates["milestone_posted"] = milestone
+        update_group_challenge_row(row["id"], **updates)
+        row.update(updates)
+        await edit_challenge_message(row, progress)
+    else:
+        update_group_challenge_row(row["id"], **updates)
+
+# ================= DAILY ROLLOVER =================
+
+async def process_daily_rollover(send_messages: bool = True):
+    """
+    Handles end-of-day processing for all users:
+    - saves previous day metrics to daily_metrics
+    - processes streak logic
+    - resets daily fields for the new day
+    """
+    today = str(local_today())
+    now_iso = local_now().isoformat()
+    today_start = datetime.combine(local_today(), time.min)
+
+    user_ids = [r[0] for r in cursor.execute("SELECT user_id FROM users").fetchall()]
+
+    for user_id in user_ids:
+        data = get_user(user_id)
+        if not data:
+            continue
+
+        last_reset = data.get("last_reset")
+        if last_reset == today:
+            continue
+
+        previous_day = last_reset
+        if previous_day:
+            standing_prev, _, _ = add_elapsed_to_totals_until(data, today_start)
+            goal_reached_prev = int(data.get("daily_goal_reached") or 0)
+            switches_prev = int(data.get("total_switches_today") or 0)
+            active_prev = int(data.get("active_today") or 0)
+
+            save_daily_metrics(
+                user_id=user_id,
+                metric_date=previous_day,
+                standing_sec=float(standing_prev or 0),
+                goal_reached=goal_reached_prev,
+                switches=switches_prev,
+                active=active_prev
+            )
+
+        goal_set_today = int(data.get("goal_set_today") or 0)
+        daily_goal_reached = int(data.get("daily_goal_reached") or 0)
+        missed_goal_count = int(data.get("missed_goal_count") or 0)
+        streak_day_processed = data.get("streak_day_processed")
+
+        if previous_day and streak_day_processed != previous_day:
+            if goal_set_today == 1 and daily_goal_reached == 0:
+                if missed_goal_count == 0:
+                    upsert_user(
+                        user_id,
+                        missed_goal_count=1,
+                        streak_day_processed=previous_day
+                    )
+                    if send_messages:
+                        try:
+                            user = await bot.fetch_user(user_id)
+                            await user.send(STREAK_FREEZE_MESSAGE)
+                        except discord.Forbidden:
+                            print(f"Could not DM user {user_id} (DMs disabled).")
+                else:
+                    upsert_user(
+                        user_id,
+                        current_streak=0,
+                        missed_goal_count=0,
+                        streak_day_processed=previous_day
+                    )
+                    if send_messages:
+                        try:
+                            user = await bot.fetch_user(user_id)
+                            await user.send(STREAK_RESET_MESSAGE)
+                        except discord.Forbidden:
+                            print(f"Could not DM user {user_id} (DMs disabled).")
+
+        upsert_user(
+            user_id,
+            total_standing=0,
+            total_seated=0,
+            daily_goal_sec=None,
+            daily_goal_reached=0,
+            goal_set_today=0,
+            streak_day_processed=None,
+            streak_awarded_today=0,
+            total_switches_today=0,
+            active_today=0,
+            status="inactive",
+            prev_timestamp=now_iso,
+            last_reminder_session_start=None,
+            last_stand_reminder_session_start=None,
+            last_reset=today
+        )
+
 # ================= ACTIONS =================
 
 async def action_stand(user: discord.User | discord.Member):
     user_id = user.id
     ensure_today(user_id)
+    mark_user_active(user_id)
     row = get_user(user_id)
-    now = datetime.now()
+    now = local_now()
 
     if row["status"] == "seated":
         prev = datetime.fromisoformat(row["prev_timestamp"])
@@ -269,6 +986,7 @@ async def action_stand(user: discord.User | discord.Member):
             total_seated=float(row["total_seated"] or 0) + elapsed,
             prev_timestamp=now.isoformat(),
             status="standing",
+            total_switches_today=int(row.get("total_switches_today") or 0) + 1,
             last_reminder_session_start=None,
             last_stand_reminder_session_start=None
         )
@@ -286,8 +1004,9 @@ async def action_stand(user: discord.User | discord.Member):
 async def action_sit(user: discord.User | discord.Member):
     user_id = user.id
     ensure_today(user_id)
+    mark_user_active(user_id)
     row = get_user(user_id)
-    now = datetime.now()
+    now = local_now()
 
     if row["status"] == "standing":
         prev = datetime.fromisoformat(row["prev_timestamp"])
@@ -297,6 +1016,7 @@ async def action_sit(user: discord.User | discord.Member):
             total_standing=float(row["total_standing"] or 0) + elapsed,
             prev_timestamp=now.isoformat(),
             status="seated",
+            total_switches_today=int(row.get("total_switches_today") or 0) + 1,
             last_reminder_session_start=None,
             last_stand_reminder_session_start=None
         )
@@ -314,8 +1034,9 @@ async def action_sit(user: discord.User | discord.Member):
 async def action_end(user: discord.User | discord.Member):
     user_id = user.id
     ensure_today(user_id)
+    mark_user_active(user_id)
     row = get_user(user_id)
-    now = datetime.now()
+    now = local_now()
 
     if row["status"] in ("standing", "seated"):
         prev = datetime.fromisoformat(row["prev_timestamp"])
@@ -354,6 +1075,7 @@ async def action_end(user: discord.User | discord.Member):
 async def action_status(user: discord.User | discord.Member):
     user_id = user.id
     ensure_today(user_id)
+    mark_user_active(user_id)
     row = get_user(user_id)
     standing, seated, elapsed = add_elapsed_to_totals(row)
 
@@ -367,6 +1089,7 @@ async def action_status(user: discord.User | discord.Member):
 async def action_daily(user: discord.User | discord.Member):
     user_id = user.id
     ensure_today(user_id)
+    mark_user_active(user_id)
     row = get_user(user_id)
 
     streak_line = get_streak_text(row)
@@ -404,6 +1127,7 @@ async def action_overview(user: discord.User | discord.Member):
 
 async def action_reminder_info(user: discord.User | discord.Member):
     ensure_today(user.id)
+    mark_user_active(user.id)
     row = get_user(user.id)
 
     sit_enabled = bool(row.get("reminder_enabled", 0)) and bool(row.get("reminder_sec"))
@@ -428,7 +1152,7 @@ async def action_reminder_info(user: discord.User | discord.Member):
 
 class CustomGoalModal(ui.Modal, title="Set a custom daily goal"):
     minutes = ui.TextInput(
-        label="How many minutes standing today?",
+        label="How many minutes of standing today?",
         placeholder="e.g., 45",
         required=True,
         max_length=4
@@ -470,7 +1194,7 @@ class CustomGoalModal(ui.Modal, title="Set a custom daily goal"):
 
 class CustomSitReminderModal(ui.Modal, title="Custom reminder (Sitting → Stand)"):
     minutes = ui.TextInput(
-        label="Remind me after how many minutes sitting?",
+        label="Remind me after how many minutes of sitting?",
         placeholder="e.g., 45",
         required=True,
         max_length=4
@@ -508,7 +1232,7 @@ class CustomSitReminderModal(ui.Modal, title="Custom reminder (Sitting → Stand
 
 class CustomStandReminderModal(ui.Modal, title="Custom reminder (Standing → Sit)"):
     minutes = ui.TextInput(
-        label="Remind me after how many minutes standing?",
+        label="Remind me after how many minutes of standing?",
         placeholder="e.g., 30",
         required=True,
         max_length=4
@@ -543,30 +1267,6 @@ class CustomStandReminderModal(ui.Modal, title="Custom reminder (Standing → Si
         text = await action_reminder_info(interaction.user)
         await interaction.response.send_message(f"✅ Standing reminder set!\n\n{text}", ephemeral=False)
 
-# ================= NOTES (Table height note) =================
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS notes (
-    user_id INTEGER PRIMARY KEY,
-    note TEXT
-)
-""")
-conn.commit()
-
-
-def get_note(user_id: int) -> str | None:
-    cursor.execute("SELECT note FROM notes WHERE user_id=?", (user_id,))
-    row = cursor.fetchone()
-    return row[0] if row else None
-
-
-def set_note(user_id: int, note: str):
-    cursor.execute("""
-    INSERT INTO notes (user_id, note) VALUES (?, ?)
-    ON CONFLICT(user_id) DO UPDATE SET note=excluded.note
-    """, (user_id, note))
-    conn.commit()
-
 
 class NoteEditModal(ui.Modal, title="Edit your table height note"):
     note = ui.TextInput(
@@ -589,6 +1289,7 @@ class NoteEditModal(ui.Modal, title="Edit your table height note"):
             return
 
         text = str(self.note.value).strip()
+        mark_user_active(self.owner_id)
         set_note(self.owner_id, text)
         await interaction.response.send_message("✅ Saved!", ephemeral=True)
 
@@ -775,6 +1476,7 @@ class MenuView(BaseOwnedView):
     @ui.button(label="Table notes", style=discord.ButtonStyle.secondary)
     async def table_note(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.defer()
+        mark_user_active(interaction.user.id)
         next_view = NoteView(self.owner_id)
         next_view.message = interaction.message
         note = get_note(interaction.user.id)
@@ -799,6 +1501,7 @@ async def menu(ctx):
         await ctx.send("Please use DM to talk to me 🙂")
         return
     ensure_today(ctx.author.id)
+    mark_user_active(ctx.author.id)
     view = MenuView(ctx.author.id)
     message = await ctx.send(f"Hi {ctx.author.mention}", view=view)
     view.message = message
@@ -860,12 +1563,12 @@ async def end(ctx):
         return await ctx.send("Please use DM to talk to me 🙂")
     await ctx.send(await action_end(ctx.author))
 
-# ================= GOAL + REMINDER + ROLLOVER CHECKERS =================
+# ================= CHECKERS =================
 
 @tasks.loop(minutes=1)
 async def goal_checker():
     user_ids = [r[0] for r in cursor.execute("SELECT user_id FROM users").fetchall()]
-    today = str(date.today())
+    today = str(local_today())
 
     for user_id in user_ids:
         data = get_user(user_id)
@@ -884,21 +1587,28 @@ async def goal_checker():
         standing, _, _ = add_elapsed_to_totals(data)
 
         if standing >= int(data["daily_goal_sec"]):
-            new_streak = int(data.get("current_streak") or 0) + 1
+            updates = {
+                "daily_goal_reached": 1
+            }
 
-            upsert_user(
-                user_id,
-                daily_goal_reached=1,
-                current_streak=new_streak,
-                missed_goal_count=0,
-                streak_day_processed=today
-            )
+            # Only award streak once per day
+            if int(data.get("streak_awarded_today") or 0) == 0:
+                new_streak = int(data.get("current_streak") or 0) + 1
+                updates["current_streak"] = new_streak
+                updates["missed_goal_count"] = 0
+                updates["streak_day_processed"] = today
+                updates["streak_awarded_today"] = 1
+                streak_message = f"🔥 Your streak is now **{new_streak}**."
+            else:
+                streak_message = "🔥 Your streak has already been counted for today."
+
+            upsert_user(user_id, **updates)
 
             try:
                 user = await bot.fetch_user(user_id)
                 await user.send(
                     "🎉 You reached your daily goal!\n"
-                    f"🔥 Your streak is now **{new_streak}**."
+                    f"{streak_message}"
                 )
             except discord.Forbidden:
                 print(f"Could not DM user {user_id} (DMs disabled).")
@@ -913,7 +1623,7 @@ async def reminder_checker():
         if not data:
             continue
 
-        now = datetime.now()
+        now = local_now()
 
         if data.get("reminder_enabled") and data.get("reminder_sec") and data.get("status") == "seated":
             session_start = data.get("prev_timestamp")
@@ -952,75 +1662,12 @@ async def reminder_checker():
 
 @tasks.loop(minutes=1)
 async def daily_rollover_checker():
-    """
-    Handles end-of-day processing:
-    - if a user set a goal today but did not reach it:
-        - first miss in a row -> protect streak, send freeze message
-        - second consecutive miss -> reset streak, send reset message
-    - if no goal was set today -> do nothing to streak
-    - resets status to inactive and clears today's data for the new day
-    """
-    today = str(date.today())
-    now_iso = datetime.now().isoformat()
+    await process_daily_rollover(send_messages=True)
 
-    user_ids = [r[0] for r in cursor.execute("SELECT user_id FROM users").fetchall()]
 
-    for user_id in user_ids:
-        data = get_user(user_id)
-        if not data:
-            continue
-
-        last_reset = data.get("last_reset")
-        if last_reset == today:
-            continue
-
-        # Process previous day's streak outcome only once
-        goal_set_today = int(data.get("goal_set_today") or 0)
-        daily_goal_reached = int(data.get("daily_goal_reached") or 0)
-        current_streak = int(data.get("current_streak") or 0)
-        missed_goal_count = int(data.get("missed_goal_count") or 0)
-        streak_day_processed = data.get("streak_day_processed")
-        previous_day = last_reset
-
-        if previous_day and streak_day_processed != previous_day:
-            if goal_set_today == 1 and daily_goal_reached == 0:
-                try:
-                    user = await bot.fetch_user(user_id)
-
-                    if missed_goal_count == 0:
-                        upsert_user(
-                            user_id,
-                            missed_goal_count=1,
-                            streak_day_processed=previous_day
-                        )
-                        await user.send(STREAK_FREEZE_MESSAGE)
-
-                    else:
-                        upsert_user(
-                            user_id,
-                            current_streak=0,
-                            missed_goal_count=0,
-                            streak_day_processed=previous_day
-                        )
-                        await user.send(STREAK_RESET_MESSAGE)
-
-                except discord.Forbidden:
-                    print(f"Could not DM user {user_id} (DMs disabled).")
-
-        # Reset for new day
-        upsert_user(
-            user_id,
-            total_standing=0,
-            total_seated=0,
-            daily_goal_reached=0,
-            goal_set_today=0,
-            streak_day_processed=None,
-            status="inactive",
-            prev_timestamp=now_iso,
-            last_reminder_session_start=None,
-            last_stand_reminder_session_start=None,
-            last_reset=today
-        )
+@tasks.loop(minutes=1)
+async def group_challenge_checker():
+    await process_group_challenge()
 
 # ================= EVENTS =================
 
@@ -1028,6 +1675,9 @@ async def daily_rollover_checker():
 async def on_ready():
     print("Bot ready")
     print(f"Using database at: {DB_PATH}")
+
+    await process_daily_rollover(send_messages=True)
+    await process_group_challenge()
 
     if not goal_checker.is_running():
         goal_checker.start()
@@ -1037,6 +1687,9 @@ async def on_ready():
 
     if not daily_rollover_checker.is_running():
         daily_rollover_checker.start()
+
+    if not group_challenge_checker.is_running():
+        group_challenge_checker.start()
 
 # ================= RUN AND RESTART =================
 

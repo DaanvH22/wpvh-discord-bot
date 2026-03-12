@@ -884,11 +884,12 @@ async def process_daily_rollover(send_messages: bool = True):
     """
     Handles end-of-day processing for all users:
     - saves previous day metrics to daily_metrics
-    - processes streak logic
-    - resets daily fields for the new day
+    - processes streak logic for the previous day
+    - resets everyone to inactive for the new day
     """
     today = str(local_today())
-    now_iso = local_now().isoformat()
+    now_dt = local_now()
+    now_iso = now_dt.isoformat()
     today_start = datetime.combine(local_today(), time.min)
 
     user_ids = [r[0] for r in cursor.execute("SELECT user_id FROM users").fetchall()]
@@ -903,8 +904,15 @@ async def process_daily_rollover(send_messages: bool = True):
             continue
 
         previous_day = last_reset
+
+        # Calculate previous day's final standing total
+        standing_prev = float(data.get("total_standing") or 0)
+        if data.get("status") == "standing":
+            prev = datetime.fromisoformat(data["prev_timestamp"])
+            standing_prev += max(0, (today_start - prev).total_seconds())
+
+        # Save previous day's metrics
         if previous_day:
-            standing_prev, _, _ = add_elapsed_to_totals_until(data, today_start)
             goal_reached_prev = int(data.get("daily_goal_reached") or 0)
             switches_prev = int(data.get("total_switches_today") or 0)
             active_prev = int(data.get("active_today") or 0)
@@ -912,12 +920,13 @@ async def process_daily_rollover(send_messages: bool = True):
             save_daily_metrics(
                 user_id=user_id,
                 metric_date=previous_day,
-                standing_sec=float(standing_prev or 0),
+                standing_sec=standing_prev,
                 goal_reached=goal_reached_prev,
                 switches=switches_prev,
                 active=active_prev
             )
 
+        # Process streak logic for previous day
         goal_set_today = int(data.get("goal_set_today") or 0)
         daily_goal_reached = int(data.get("daily_goal_reached") or 0)
         missed_goal_count = int(data.get("missed_goal_count") or 0)
@@ -951,6 +960,7 @@ async def process_daily_rollover(send_messages: bool = True):
                         except discord.Forbidden:
                             print(f"Could not DM user {user_id} (DMs disabled).")
 
+        # Start new day clean: always inactive
         upsert_user(
             user_id,
             total_standing=0,

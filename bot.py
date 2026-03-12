@@ -40,12 +40,14 @@ CREATE TABLE IF NOT EXISTS users (
 """)
 conn.commit()
 
+
 def _add_column_if_missing(col_name: str, col_type: str):
     try:
         cursor.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
         conn.commit()
     except sqlite3.OperationalError:
         pass
+
 
 # Sitting reminder
 _add_column_if_missing("reminder_sec", "INTEGER")
@@ -57,6 +59,12 @@ _add_column_if_missing("reminder_stand_sec", "INTEGER")
 _add_column_if_missing("reminder_stand_enabled", "INTEGER")
 _add_column_if_missing("last_stand_reminder_session_start", "TEXT")
 
+# Streak system
+_add_column_if_missing("goal_set_today", "INTEGER")
+_add_column_if_missing("current_streak", "INTEGER")
+_add_column_if_missing("missed_goal_count", "INTEGER")
+_add_column_if_missing("streak_day_processed", "TEXT")
+
 # ================= CONFIG =================
 
 GOAL_PRESETS_MIN = {"easy": 30, "medium": 90, "hard": 180}
@@ -66,9 +74,25 @@ RECOMMENDED_STAND_REMINDER_MIN = 30
 
 MENU_TIMEOUT_SECONDS = 7200
 
+STREAK_FREEZE_MESSAGE = (
+    "You missed your goal today, but your streak is protected this time. 🔥\n"
+    "Reach your goal next time to keep it going."
+)
+
+STREAK_RESET_MESSAGE = (
+    "Your streak has reset this time, but that also means a fresh start. 🌱\n"
+    "Set a goal and reach it again to start a new streak."
+)
+
 # ================= HELPERS =================
 
 def ensure_today(user_id: int):
+    """
+    Ensures the user exists and has data for today.
+    Note:
+    - The actual 'end of day' streak logic is handled by daily_rollover_checker().
+    - This function is only a safety net reset in case a user record is still on an old day.
+    """
     today = str(date.today())
     cursor.execute("SELECT last_reset FROM users WHERE user_id=?", (user_id,))
     row = cursor.fetchone()
@@ -80,26 +104,40 @@ def ensure_today(user_id: int):
                 user_id,total_standing,total_seated,prev_timestamp,status,
                 daily_goal_sec,daily_goal_reached,last_reset,
                 reminder_sec,reminder_enabled,last_reminder_session_start,
-                reminder_stand_sec,reminder_stand_enabled,last_stand_reminder_session_start
+                reminder_stand_sec,reminder_stand_enabled,last_stand_reminder_session_start,
+                goal_set_today,current_streak,missed_goal_count,streak_day_processed
             )
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             user_id, 0, 0, now, "inactive",
             None, 0, today,
             None, 0, None,
-            None, 0, None
+            None, 0, None,
+            0, 0, 0, None
         ))
         conn.commit()
+
     elif row[0] != today:
+        # Safety reset if rollover checker has not processed yet.
+        # We do NOT apply streak penalties here to avoid double-processing.
+        # The intended flow is that daily_rollover_checker handles streak outcomes.
+        now = datetime.now().isoformat()
         cursor.execute("""
             UPDATE users SET
                 total_standing=0,
                 total_seated=0,
                 daily_goal_reached=0,
+                goal_set_today=0,
+                streak_day_processed=NULL,
+                status='inactive',
+                prev_timestamp=?,
+                last_reminder_session_start=NULL,
+                last_stand_reminder_session_start=NULL,
                 last_reset=?
             WHERE user_id=?
-        """, (today, user_id))
+        """, (now, today, user_id))
         conn.commit()
+
 
 def get_user(user_id: int):
     cursor.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
@@ -117,7 +155,14 @@ def get_user(user_id: int):
     data.setdefault("reminder_stand_sec", None)
     data.setdefault("reminder_stand_enabled", 0)
     data.setdefault("last_stand_reminder_session_start", None)
+
+    data.setdefault("goal_set_today", 0)
+    data.setdefault("current_streak", 0)
+    data.setdefault("missed_goal_count", 0)
+    data.setdefault("streak_day_processed", None)
+
     return data
+
 
 def upsert_user(user_id: int, **kwargs):
     if not kwargs:
@@ -127,14 +172,16 @@ def upsert_user(user_id: int, **kwargs):
     cursor.execute(f"UPDATE users SET {fields} WHERE user_id=?", values)
     conn.commit()
 
+
 def format_time(seconds: float):
     seconds = max(0, int(seconds))
     minutes = int(seconds // 60)
     hours = int(minutes // 60)
     minutes = minutes % 60
     if hours > 0:
-        return f"{hours} hours {minutes} min"
+        return f"{hours} hour(s) {minutes} min"
     return f"{minutes} min"
+
 
 def add_elapsed_to_totals(row: dict):
     now = datetime.now()
@@ -151,12 +198,19 @@ def add_elapsed_to_totals(row: dict):
 
     return standing, seated, elapsed
 
+
 def set_daily_goal(user_id: int, minutes: int):
     minutes = int(minutes)
     if minutes <= 0:
         raise ValueError("minutes must be > 0")
     ensure_today(user_id)
-    upsert_user(user_id, daily_goal_sec=minutes * 60, daily_goal_reached=0)
+    upsert_user(
+        user_id,
+        daily_goal_sec=minutes * 60,
+        daily_goal_reached=0,
+        goal_set_today=1
+    )
+
 
 def set_sit_reminder(user_id: int, minutes: int):
     minutes = int(minutes)
@@ -170,6 +224,7 @@ def set_sit_reminder(user_id: int, minutes: int):
         last_reminder_session_start=None
     )
 
+
 def set_stand_reminder(user_id: int, minutes: int):
     minutes = int(minutes)
     if minutes <= 0:
@@ -182,13 +237,21 @@ def set_stand_reminder(user_id: int, minutes: int):
         last_stand_reminder_session_start=None
     )
 
+
 def disable_sit_reminder(user_id: int):
     ensure_today(user_id)
     upsert_user(user_id, reminder_enabled=0, last_reminder_session_start=None)
 
+
 def disable_stand_reminder(user_id: int):
     ensure_today(user_id)
     upsert_user(user_id, reminder_stand_enabled=0, last_stand_reminder_session_start=None)
+
+
+def get_streak_text(row: dict) -> str:
+    streak = int(row.get("current_streak") or 0)
+    return f"🔥 **Streak:** {streak}"
+
 
 # ================= ACTIONS =================
 
@@ -219,6 +282,7 @@ async def action_stand(user: discord.User | discord.Member):
     )
     return f"{user.mention} is now **standing**."
 
+
 async def action_sit(user: discord.User | discord.Member):
     user_id = user.id
     ensure_today(user_id)
@@ -245,6 +309,7 @@ async def action_sit(user: discord.User | discord.Member):
         last_reminder_session_start=None
     )
     return f"{user.mention} is now **sitting**."
+
 
 async def action_end(user: discord.User | discord.Member):
     user_id = user.id
@@ -285,6 +350,7 @@ async def action_end(user: discord.User | discord.Member):
 
     return f"{user.mention} is now **inactive**. (Stopped tracking for now.)"
 
+
 async def action_status(user: discord.User | discord.Member):
     user_id = user.id
     ensure_today(user_id)
@@ -297,13 +363,19 @@ async def action_status(user: discord.User | discord.Member):
         f"Today standing: **{format_time(standing)}** | seated: **{format_time(seated)}**"
     )
 
+
 async def action_daily(user: discord.User | discord.Member):
     user_id = user.id
     ensure_today(user_id)
     row = get_user(user_id)
 
+    streak_line = get_streak_text(row)
+
     if row["daily_goal_sec"] is None:
-        return f"{user.mention} no daily goal set yet. Use **Set goal**."
+        return (
+            f"{user.mention} no daily goal set yet. Use **Set goal**.\n"
+            f"{streak_line}"
+        )
 
     standing, _, _ = add_elapsed_to_totals(row)
     goal = int(row["daily_goal_sec"])
@@ -312,18 +384,23 @@ async def action_daily(user: discord.User | discord.Member):
     percentage = min(100, max(0, percentage))
 
     reached = "✅ reached" if row["daily_goal_reached"] else "⏳ not reached yet"
+    goal_set_today_text = "Yes" if int(row.get("goal_set_today") or 0) == 1 else "No"
 
     return (
         f"{user.mention} **Daily goal** ({reached})\n"
         f"Goal: **{format_time(goal)}**\n"
         f"Progress: **{format_time(standing)}**\n"
-        f"Completed: **{percentage}%**"
+        f"Completed: **{percentage}%**\n"
+        f"Goal set today: **{goal_set_today_text}**\n"
+        f"{streak_line}"
     )
+
 
 async def action_overview(user: discord.User | discord.Member):
     status_text = await action_status(user)
     daily_text = await action_daily(user)
     return f"{status_text}\n\n{daily_text}"
+
 
 async def action_reminder_info(user: discord.User | discord.Member):
     ensure_today(user.id)
@@ -383,10 +460,13 @@ class CustomGoalModal(ui.Modal, title="Set a custom daily goal"):
             return
 
         set_daily_goal(interaction.user.id, mins)
+        row = get_user(interaction.user.id)
         await interaction.response.send_message(
-            f"{interaction.user.mention} daily goal set to **{mins} minutes** (custom).",
+            f"{interaction.user.mention} daily goal set to **{mins} minutes** (custom).\n"
+            f"{get_streak_text(row)}",
             ephemeral=False
         )
+
 
 class CustomSitReminderModal(ui.Modal, title="Custom reminder (Sitting → Stand)"):
     minutes = ui.TextInput(
@@ -424,6 +504,7 @@ class CustomSitReminderModal(ui.Modal, title="Custom reminder (Sitting → Stand
         set_sit_reminder(interaction.user.id, mins)
         text = await action_reminder_info(interaction.user)
         await interaction.response.send_message(f"✅ Sitting reminder set!\n\n{text}", ephemeral=False)
+
 
 class CustomStandReminderModal(ui.Modal, title="Custom reminder (Standing → Sit)"):
     minutes = ui.TextInput(
@@ -472,10 +553,12 @@ CREATE TABLE IF NOT EXISTS notes (
 """)
 conn.commit()
 
+
 def get_note(user_id: int) -> str | None:
     cursor.execute("SELECT note FROM notes WHERE user_id=?", (user_id,))
     row = cursor.fetchone()
     return row[0] if row else None
+
 
 def set_note(user_id: int, note: str):
     cursor.execute("""
@@ -483,6 +566,7 @@ def set_note(user_id: int, note: str):
     ON CONFLICT(user_id) DO UPDATE SET note=excluded.note
     """, (user_id, note))
     conn.commit()
+
 
 class NoteEditModal(ui.Modal, title="Edit your table height note"):
     note = ui.TextInput(
@@ -579,6 +663,7 @@ class GoalView(BaseOwnedView):
         next_view.message = interaction.message
         await interaction.message.edit(content=f"Hi {interaction.user.mention}", view=next_view)
 
+
 class ReminderView(BaseOwnedView):
     def __init__(self, owner_id: int):
         super().__init__(owner_id=owner_id)
@@ -630,6 +715,7 @@ class ReminderView(BaseOwnedView):
         next_view.message = interaction.message
         await interaction.message.edit(content=f"Hi {interaction.user.mention}", view=next_view)
 
+
 class NoteView(BaseOwnedView):
     def __init__(self, owner_id: int):
         super().__init__(owner_id=owner_id)
@@ -644,6 +730,7 @@ class NoteView(BaseOwnedView):
         next_view = MenuView(self.owner_id)
         next_view.message = interaction.message
         await interaction.message.edit(content=f"Hi {interaction.user.mention}", view=next_view)
+
 
 class MenuView(BaseOwnedView):
     def __init__(self, owner_id: int):
@@ -716,11 +803,13 @@ async def menu(ctx):
     message = await ctx.send(f"Hi {ctx.author.mention}", view=view)
     view.message = message
 
+
 @bot.command()
 async def stand(ctx):
     if ctx.guild:
         return await ctx.send("Please use DM to talk to me 🙂")
     await ctx.send(await action_stand(ctx.author))
+
 
 @bot.command()
 async def sit(ctx):
@@ -728,11 +817,13 @@ async def sit(ctx):
         return await ctx.send("Please use DM to talk to me 🙂")
     await ctx.send(await action_sit(ctx.author))
 
+
 @bot.command()
 async def status(ctx):
     if ctx.guild:
         return await ctx.send("Please use DM to talk to me 🙂")
     await ctx.send(await action_status(ctx.author))
+
 
 @bot.command()
 async def daily(ctx):
@@ -740,11 +831,13 @@ async def daily(ctx):
         return await ctx.send("Please use DM to talk to me 🙂")
     await ctx.send(await action_daily(ctx.author))
 
+
 @bot.command()
 async def overview(ctx):
     if ctx.guild:
         return await ctx.send("Please use DM to talk to me 🙂")
     await ctx.send(await action_overview(ctx.author))
+
 
 @bot.command()
 async def setdaily(ctx, minutes: int):
@@ -754,7 +847,12 @@ async def setdaily(ctx, minutes: int):
         set_daily_goal(ctx.author.id, minutes)
     except ValueError:
         return await ctx.send(f"{ctx.author.mention} minutes must be > 0.")
-    await ctx.send(f"{ctx.author.mention} goal set to {minutes} minutes")
+    row = get_user(ctx.author.id)
+    await ctx.send(
+        f"{ctx.author.mention} goal set to {minutes} minutes\n"
+        f"{get_streak_text(row)}"
+    )
+
 
 @bot.command()
 async def end(ctx):
@@ -762,29 +860,49 @@ async def end(ctx):
         return await ctx.send("Please use DM to talk to me 🙂")
     await ctx.send(await action_end(ctx.author))
 
-# ================= GOAL + REMINDER CHECKERS =================
+# ================= GOAL + REMINDER + ROLLOVER CHECKERS =================
 
 @tasks.loop(minutes=1)
 async def goal_checker():
     user_ids = [r[0] for r in cursor.execute("SELECT user_id FROM users").fetchall()]
+    today = str(date.today())
 
     for user_id in user_ids:
         data = get_user(user_id)
         if not data:
             continue
 
-        if not data.get("daily_goal_sec") or data.get("daily_goal_reached"):
+        if not data.get("daily_goal_sec"):
+            continue
+
+        if int(data.get("goal_set_today") or 0) != 1:
+            continue
+
+        if int(data.get("daily_goal_reached") or 0) == 1:
             continue
 
         standing, _, _ = add_elapsed_to_totals(data)
 
         if standing >= int(data["daily_goal_sec"]):
-            upsert_user(user_id, daily_goal_reached=1)
+            new_streak = int(data.get("current_streak") or 0) + 1
+
+            upsert_user(
+                user_id,
+                daily_goal_reached=1,
+                current_streak=new_streak,
+                missed_goal_count=0,
+                streak_day_processed=today
+            )
+
             try:
                 user = await bot.fetch_user(user_id)
-                await user.send("🎉 You reached your daily goal!")
+                await user.send(
+                    "🎉 You reached your daily goal!\n"
+                    f"🔥 Your streak is now **{new_streak}**."
+                )
             except discord.Forbidden:
                 print(f"Could not DM user {user_id} (DMs disabled).")
+
 
 @tasks.loop(minutes=1)
 async def reminder_checker():
@@ -831,14 +949,94 @@ async def reminder_checker():
                     except discord.Forbidden:
                         print(f"Could not DM user {user_id} (DMs disabled).")
 
+
+@tasks.loop(minutes=1)
+async def daily_rollover_checker():
+    """
+    Handles end-of-day processing:
+    - if a user set a goal today but did not reach it:
+        - first miss in a row -> protect streak, send freeze message
+        - second consecutive miss -> reset streak, send reset message
+    - if no goal was set today -> do nothing to streak
+    - resets status to inactive and clears today's data for the new day
+    """
+    today = str(date.today())
+    now_iso = datetime.now().isoformat()
+
+    user_ids = [r[0] for r in cursor.execute("SELECT user_id FROM users").fetchall()]
+
+    for user_id in user_ids:
+        data = get_user(user_id)
+        if not data:
+            continue
+
+        last_reset = data.get("last_reset")
+        if last_reset == today:
+            continue
+
+        # Process previous day's streak outcome only once
+        goal_set_today = int(data.get("goal_set_today") or 0)
+        daily_goal_reached = int(data.get("daily_goal_reached") or 0)
+        current_streak = int(data.get("current_streak") or 0)
+        missed_goal_count = int(data.get("missed_goal_count") or 0)
+        streak_day_processed = data.get("streak_day_processed")
+        previous_day = last_reset
+
+        if previous_day and streak_day_processed != previous_day:
+            if goal_set_today == 1 and daily_goal_reached == 0:
+                try:
+                    user = await bot.fetch_user(user_id)
+
+                    if missed_goal_count == 0:
+                        upsert_user(
+                            user_id,
+                            missed_goal_count=1,
+                            streak_day_processed=previous_day
+                        )
+                        await user.send(STREAK_FREEZE_MESSAGE)
+
+                    else:
+                        upsert_user(
+                            user_id,
+                            current_streak=0,
+                            missed_goal_count=0,
+                            streak_day_processed=previous_day
+                        )
+                        await user.send(STREAK_RESET_MESSAGE)
+
+                except discord.Forbidden:
+                    print(f"Could not DM user {user_id} (DMs disabled).")
+
+        # Reset for new day
+        upsert_user(
+            user_id,
+            total_standing=0,
+            total_seated=0,
+            daily_goal_reached=0,
+            goal_set_today=0,
+            streak_day_processed=None,
+            status="inactive",
+            prev_timestamp=now_iso,
+            last_reminder_session_start=None,
+            last_stand_reminder_session_start=None,
+            last_reset=today
+        )
+
+# ================= EVENTS =================
+
 @bot.event
 async def on_ready():
     print("Bot ready")
     print(f"Using database at: {DB_PATH}")
+
     if not goal_checker.is_running():
         goal_checker.start()
+
     if not reminder_checker.is_running():
         reminder_checker.start()
+
+    if not daily_rollover_checker.is_running():
+        daily_rollover_checker.start()
 
 # ================= RUN AND RESTART =================
 

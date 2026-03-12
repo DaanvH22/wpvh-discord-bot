@@ -9,13 +9,21 @@ from dotenv import load_dotenv
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
+# ================= DATABASE PATH =================
+
+RAILWAY_VOLUME_MOUNT_PATH = os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+if RAILWAY_VOLUME_MOUNT_PATH:
+    DB_PATH = os.path.join(RAILWAY_VOLUME_MOUNT_PATH, "standbot.db")
+else:
+    DB_PATH = "standbot.db"
+
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ================= DATABASE =================
 
-conn = sqlite3.connect("standbot.db")
+conn = sqlite3.connect(DB_PATH)
 cursor = conn.cursor()
 
 cursor.execute("""
@@ -32,7 +40,6 @@ CREATE TABLE IF NOT EXISTS users (
 """)
 conn.commit()
 
-# --- Lightweight "migration" for reminder fields (safe if already exists) ---
 def _add_column_if_missing(col_name: str, col_type: str):
     try:
         cursor.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
@@ -41,22 +48,23 @@ def _add_column_if_missing(col_name: str, col_type: str):
         pass
 
 # Sitting reminder
-_add_column_if_missing("reminder_sec", "INTEGER")                 # after how many seconds sitting
-_add_column_if_missing("reminder_enabled", "INTEGER")             # 0/1
-_add_column_if_missing("last_reminder_session_start", "TEXT")     # seated session start already reminded
+_add_column_if_missing("reminder_sec", "INTEGER")
+_add_column_if_missing("reminder_enabled", "INTEGER")
+_add_column_if_missing("last_reminder_session_start", "TEXT")
 
-# Standing reminder (inverse)
-_add_column_if_missing("reminder_stand_sec", "INTEGER")           # after how many seconds standing
-_add_column_if_missing("reminder_stand_enabled", "INTEGER")       # 0/1
-_add_column_if_missing("last_stand_reminder_session_start", "TEXT")  # standing session start already reminded
+# Standing reminder
+_add_column_if_missing("reminder_stand_sec", "INTEGER")
+_add_column_if_missing("reminder_stand_enabled", "INTEGER")
+_add_column_if_missing("last_stand_reminder_session_start", "TEXT")
 
 # ================= CONFIG =================
 
 GOAL_PRESETS_MIN = {"easy": 30, "medium": 90, "hard": 180}
 
-# Recommended reminder times (you can tweak these)
-RECOMMENDED_SIT_REMINDER_MIN = 30     # remind to stand after sitting
-RECOMMENDED_STAND_REMINDER_MIN = 30   # remind to sit after standing
+RECOMMENDED_SIT_REMINDER_MIN = 30
+RECOMMENDED_STAND_REMINDER_MIN = 30
+
+MENU_TIMEOUT_SECONDS = 7200
 
 # ================= HELPERS =================
 
@@ -103,7 +111,6 @@ def get_user(user_id: int):
     cols = [c[1] for c in cursor.fetchall()]
     data = dict(zip(cols, row))
 
-    # Ensure keys exist (in case migration order differs)
     data.setdefault("reminder_sec", None)
     data.setdefault("reminder_enabled", 0)
     data.setdefault("last_reminder_session_start", None)
@@ -337,7 +344,7 @@ async def action_reminder_info(user: discord.User | discord.Member):
         f"{user.mention} **Reminders**\n"
         f"• Sitting → Stand: **{sit_line}**\n"
         f"• Standing → Sit: **{stand_line}**\n\n"
-        f"Use the buttons below to set or change them."
+        f"Use the buttons to set or change them again."
     )
 
 # ================= MODALS =================
@@ -501,12 +508,13 @@ class NoteEditModal(ui.Modal, title="Edit your table height note"):
         set_note(self.owner_id, text)
         await interaction.response.send_message("✅ Saved!", ephemeral=True)
 
-# ================= VIEWS =================
+# ================= BASE VIEW WITH TIMEOUT MESSAGE =================
 
-class GoalView(ui.View):
-    def __init__(self, owner_id: int):
-        super().__init__(timeout=600)
+class BaseOwnedView(ui.View):
+    def __init__(self, owner_id: int, timeout: int = MENU_TIMEOUT_SECONDS):
+        super().__init__(timeout=timeout)
         self.owner_id = owner_id
+        self.message = None
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
@@ -517,26 +525,48 @@ class GoalView(ui.View):
             return False
         return True
 
+    async def on_timeout(self):
+        if self.message is not None:
+            try:
+                await self.message.edit(
+                    content="This menu has timed out. Please type **!menu** to open a new one.",
+                    view=None
+                )
+            except Exception:
+                pass
+
+# ================= VIEWS =================
+
+class GoalView(BaseOwnedView):
+    def __init__(self, owner_id: int):
+        super().__init__(owner_id=owner_id)
+
     @ui.button(label="Easy (30 min)", style=discord.ButtonStyle.success)
     async def easy(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.defer()
         set_daily_goal(interaction.user.id, GOAL_PRESETS_MIN["easy"])
+        next_view = MenuView(self.owner_id)
+        next_view.message = interaction.message
         text = await action_daily(interaction.user)
-        await interaction.message.edit(content=f"✅ Goal set!\n\n{text}", view=MenuView(self.owner_id))
+        await interaction.message.edit(content=f"✅ Goal set!\n\n{text}", view=next_view)
 
-    @ui.button(label="Medium (60 min)", style=discord.ButtonStyle.primary)
+    @ui.button(label="Medium (1 hour 30 min)", style=discord.ButtonStyle.primary)
     async def medium(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.defer()
         set_daily_goal(interaction.user.id, GOAL_PRESETS_MIN["medium"])
+        next_view = MenuView(self.owner_id)
+        next_view.message = interaction.message
         text = await action_daily(interaction.user)
-        await interaction.message.edit(content=f"✅ Goal set!\n\n{text}", view=MenuView(self.owner_id))
+        await interaction.message.edit(content=f"✅ Goal set!\n\n{text}", view=next_view)
 
-    @ui.button(label="Hard (120 min)", style=discord.ButtonStyle.danger)
+    @ui.button(label="Hard (3 hours)", style=discord.ButtonStyle.danger)
     async def hard(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.defer()
         set_daily_goal(interaction.user.id, GOAL_PRESETS_MIN["hard"])
+        next_view = MenuView(self.owner_id)
+        next_view.message = interaction.message
         text = await action_daily(interaction.user)
-        await interaction.message.edit(content=f"✅ Goal set!\n\n{text}", view=MenuView(self.owner_id))
+        await interaction.message.edit(content=f"✅ Goal set!\n\n{text}", view=next_view)
 
     @ui.button(label="Custom…", style=discord.ButtonStyle.secondary)
     async def custom(self, interaction: discord.Interaction, button: ui.Button):
@@ -545,27 +575,19 @@ class GoalView(ui.View):
     @ui.button(label="Back", style=discord.ButtonStyle.secondary)
     async def back(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.defer()
-        await interaction.message.edit(content=f"Hi {interaction.user.mention}", view=MenuView(self.owner_id))
+        next_view = MenuView(self.owner_id)
+        next_view.message = interaction.message
+        await interaction.message.edit(content=f"Hi {interaction.user.mention}", view=next_view)
 
-class ReminderView(ui.View):
+class ReminderView(BaseOwnedView):
     def __init__(self, owner_id: int):
-        super().__init__(timeout=600)
-        self.owner_id = owner_id
+        super().__init__(owner_id=owner_id)
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.owner_id:
-            await interaction.response.send_message(
-                "These buttons aren't for you 🙂. Please type !menu in your DM with me.",
-                ephemeral=True
-            )
-            return False
-        return True
-
-    # ---- Sitting reminder ----
     @ui.button(label="Set sitting reminder to 30 min", style=discord.ButtonStyle.primary)
     async def sit_recommended(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.defer()
         set_sit_reminder(interaction.user.id, RECOMMENDED_SIT_REMINDER_MIN)
+        self.message = interaction.message
         text = await action_reminder_info(interaction.user)
         await interaction.message.edit(content=f"✅ Updated!\n\n{text}", view=self)
 
@@ -577,14 +599,15 @@ class ReminderView(ui.View):
     async def sit_off(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.defer()
         disable_sit_reminder(interaction.user.id)
+        self.message = interaction.message
         text = await action_reminder_info(interaction.user)
         await interaction.message.edit(content=f"✅ Updated!\n\n{text}", view=self)
 
-    # ---- Standing reminder ----
     @ui.button(label="Set standing reminder to 30 min", style=discord.ButtonStyle.primary, row=2)
     async def stand_recommended(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.defer()
         set_stand_reminder(interaction.user.id, RECOMMENDED_STAND_REMINDER_MIN)
+        self.message = interaction.message
         text = await action_reminder_info(interaction.user)
         await interaction.message.edit(content=f"✅ Updated!\n\n{text}", view=self)
 
@@ -596,27 +619,20 @@ class ReminderView(ui.View):
     async def stand_off(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.defer()
         disable_stand_reminder(interaction.user.id)
+        self.message = interaction.message
         text = await action_reminder_info(interaction.user)
         await interaction.message.edit(content=f"✅ Updated!\n\n{text}", view=self)
 
     @ui.button(label="Back", style=discord.ButtonStyle.secondary, row=4)
     async def back(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.defer()
-        await interaction.message.edit(content=f"Hi {interaction.user.mention}", view=MenuView(self.owner_id))
+        next_view = MenuView(self.owner_id)
+        next_view.message = interaction.message
+        await interaction.message.edit(content=f"Hi {interaction.user.mention}", view=next_view)
 
-class NoteView(ui.View):
+class NoteView(BaseOwnedView):
     def __init__(self, owner_id: int):
-        super().__init__(timeout=600)
-        self.owner_id = owner_id
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.owner_id:
-            await interaction.response.send_message(
-                "These buttons aren't for you 🙂. Please type !menu in your own DM with me.",
-                ephemeral=True
-            )
-            return False
-        return True
+        super().__init__(owner_id=owner_id)
 
     @ui.button(label="Edit note", style=discord.ButtonStyle.primary)
     async def edit(self, interaction: discord.Interaction, button: ui.Button):
@@ -625,64 +641,66 @@ class NoteView(ui.View):
     @ui.button(label="Back", style=discord.ButtonStyle.secondary)
     async def back(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.defer()
-        await interaction.message.edit(content=f"Hi {interaction.user.mention}", view=MenuView(self.owner_id))
+        next_view = MenuView(self.owner_id)
+        next_view.message = interaction.message
+        await interaction.message.edit(content=f"Hi {interaction.user.mention}", view=next_view)
 
-class MenuView(ui.View):
+class MenuView(BaseOwnedView):
     def __init__(self, owner_id: int):
-        super().__init__(timeout=7200)
-        self.owner_id = owner_id
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.owner_id:
-            await interaction.response.send_message(
-                "These buttons aren't for you 🙂. Please type !menu in your DM with me.",
-                ephemeral=True
-            )
-            return False
-        return True
+        super().__init__(owner_id=owner_id)
 
     @ui.button(label="I'm standing", style=discord.ButtonStyle.success)
     async def standing(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.defer()
+        self.message = interaction.message
         text = await action_stand(interaction.user)
         await interaction.message.edit(content=text, view=self)
 
     @ui.button(label="I'm sitting", style=discord.ButtonStyle.success)
     async def sitting(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.defer()
+        self.message = interaction.message
         text = await action_sit(interaction.user)
         await interaction.message.edit(content=text, view=self)
 
     @ui.button(label="Overview", style=discord.ButtonStyle.primary)
     async def overview(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.defer()
+        self.message = interaction.message
         text = await action_overview(interaction.user)
         await interaction.message.edit(content=text, view=self)
 
     @ui.button(label="Set goal", style=discord.ButtonStyle.primary)
     async def set_goal(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.defer()
-        await interaction.message.edit(content="Choose a daily goal:", view=GoalView(self.owner_id))
+        next_view = GoalView(self.owner_id)
+        next_view.message = interaction.message
+        await interaction.message.edit(content="Choose a daily goal:", view=next_view)
 
     @ui.button(label="Reminders", style=discord.ButtonStyle.primary)
     async def reminders(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.defer()
+        next_view = ReminderView(self.owner_id)
+        next_view.message = interaction.message
         text = await action_reminder_info(interaction.user)
-        await interaction.message.edit(content=text, view=ReminderView(self.owner_id))
+        await interaction.message.edit(content=text, view=next_view)
 
     @ui.button(label="Table notes", style=discord.ButtonStyle.secondary)
     async def table_note(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.defer()
+        next_view = NoteView(self.owner_id)
+        next_view.message = interaction.message
         note = get_note(interaction.user.id)
         if note:
             content = f"{interaction.user.mention} your saved note:\n**{note}**"
         else:
             content = f"{interaction.user.mention} you don't have a note yet. Click **Edit note** to add one."
-        await interaction.message.edit(content=content, view=NoteView(self.owner_id))
+        await interaction.message.edit(content=content, view=next_view)
 
     @ui.button(label="Pause/End", style=discord.ButtonStyle.danger)
     async def end(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.defer()
+        self.message = interaction.message
         text = await action_end(interaction.user)
         await interaction.message.edit(content=text, view=self)
 
@@ -694,7 +712,9 @@ async def menu(ctx):
         await ctx.send("Please use DM to talk to me 🙂")
         return
     ensure_today(ctx.author.id)
-    await ctx.send(f"Hi {ctx.author.mention}", view=MenuView(ctx.author.id))
+    view = MenuView(ctx.author.id)
+    message = await ctx.send(f"Hi {ctx.author.mention}", view=view)
+    view.message = message
 
 @bot.command()
 async def stand(ctx):
@@ -766,7 +786,6 @@ async def goal_checker():
             except discord.Forbidden:
                 print(f"Could not DM user {user_id} (DMs disabled).")
 
-
 @tasks.loop(minutes=1)
 async def reminder_checker():
     user_ids = [r[0] for r in cursor.execute("SELECT user_id FROM users").fetchall()]
@@ -778,7 +797,6 @@ async def reminder_checker():
 
         now = datetime.now()
 
-        # -------- Sitting -> Stand reminder --------
         if data.get("reminder_enabled") and data.get("reminder_sec") and data.get("status") == "seated":
             session_start = data.get("prev_timestamp")
             if session_start and data.get("last_reminder_session_start") != session_start:
@@ -796,7 +814,6 @@ async def reminder_checker():
                     except discord.Forbidden:
                         print(f"Could not DM user {user_id} (DMs disabled).")
 
-        # -------- Standing -> Sit reminder --------
         if data.get("reminder_stand_enabled") and data.get("reminder_stand_sec") and data.get("status") == "standing":
             session_start = data.get("prev_timestamp")
             if session_start and data.get("last_stand_reminder_session_start") != session_start:
@@ -813,15 +830,17 @@ async def reminder_checker():
                         )
                     except discord.Forbidden:
                         print(f"Could not DM user {user_id} (DMs disabled).")
+
 @bot.event
 async def on_ready():
     print("Bot ready")
+    print(f"Using database at: {DB_PATH}")
     if not goal_checker.is_running():
         goal_checker.start()
     if not reminder_checker.is_running():
         reminder_checker.start()
 
-# ================= RUN =================
+# ================= RUN AND RESTART =================
 
 while True:
     try:

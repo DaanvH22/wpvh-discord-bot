@@ -5,6 +5,7 @@ from datetime import datetime, date, timedelta, time
 from zoneinfo import ZoneInfo
 import sqlite3
 import os
+import asyncio
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -37,6 +38,12 @@ def local_today() -> date:
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# Prevent startup logic from running multiple times on reconnect
+startup_complete = False
+
+# Prevent overlapping challenge processing in the same bot process
+challenge_lock = asyncio.Lock()
 
 # ================= DATABASE =================
 
@@ -123,6 +130,13 @@ CREATE TABLE IF NOT EXISTS group_challenges (
     completed INTEGER,
     completion_message_sent INTEGER
 )
+""")
+conn.commit()
+
+# Make sure only ONE challenge row can exist per week per channel
+cursor.execute("""
+CREATE UNIQUE INDEX IF NOT EXISTS idx_group_challenge_week_channel
+ON group_challenges (week_start_date, week_end_date, channel_id)
 """)
 conn.commit()
 
@@ -615,11 +629,22 @@ def get_current_challenge_row():
            current_progress, final_progress, channel_id, message_id,
            milestone_posted, completed, completion_message_sent
     FROM group_challenges
-    WHERE week_start_date=? AND week_end_date=?
+    WHERE week_start_date=? AND week_end_date=? AND channel_id=?
     ORDER BY id DESC
     LIMIT 1
-    """, (str(week_start_date), str(week_end_date)))
+    """, (str(week_start_date), str(week_end_date), CHALLENGE_CHANNEL_ID))
 
+    return challenge_row_to_dict(cursor.fetchone())
+
+
+def get_group_challenge_row_by_id(challenge_id: int):
+    cursor.execute("""
+    SELECT id, week_start_date, week_end_date, challenge_type, target_value,
+           current_progress, final_progress, channel_id, message_id,
+           milestone_posted, completed, completion_message_sent
+    FROM group_challenges
+    WHERE id=?
+    """, (challenge_id,))
     return challenge_row_to_dict(cursor.fetchone())
 
 
@@ -633,8 +658,12 @@ def update_group_challenge_row(challenge_id: int, **kwargs):
 
 
 def create_group_challenge_row(week_start_date: str, week_end_date: str, challenge_type: str, target_value: float, channel_id: int):
+    """
+    Uses INSERT OR IGNORE so duplicate rows for the same week/channel are prevented
+    by the UNIQUE index.
+    """
     cursor.execute("""
-    INSERT INTO group_challenges (
+    INSERT OR IGNORE INTO group_challenges (
         week_start_date, week_end_date, challenge_type, target_value,
         current_progress, final_progress, channel_id, message_id,
         milestone_posted, completed, completion_message_sent
@@ -646,7 +675,16 @@ def create_group_challenge_row(week_start_date: str, week_end_date: str, challen
         0, 0, 0
     ))
     conn.commit()
-    return cursor.lastrowid
+
+    cursor.execute("""
+    SELECT id
+    FROM group_challenges
+    WHERE week_start_date=? AND week_end_date=? AND channel_id=?
+    ORDER BY id DESC
+    LIMIT 1
+    """, (week_start_date, week_end_date, channel_id))
+    row = cursor.fetchone()
+    return row[0] if row else None
 
 
 def build_challenge_message_content(challenge_type: str, target_value: float, progress_value: float, start_dt: datetime, end_dt: datetime) -> str:
@@ -696,8 +734,18 @@ async def ensure_challenge_message(row: dict):
         try:
             await channel.fetch_message(int(message_id))
             return row
-        except Exception:
+        except discord.NotFound:
+            # Message really does not exist anymore -> safe to recreate
             pass
+        except discord.Forbidden as e:
+            print(f"Cannot access existing challenge message {message_id}: {e}")
+            return row
+        except discord.HTTPException as e:
+            print(f"Temporary HTTP error while checking challenge message {message_id}: {e}")
+            return row
+        except Exception as e:
+            print(f"Unexpected error while checking challenge message {message_id}: {e}")
+            return row
 
     try:
         message = await channel.send(content)
@@ -725,7 +773,7 @@ async def edit_challenge_message(row: dict, progress_value: float):
 
     try:
         message = await channel.fetch_message(int(row["message_id"]))
-    except Exception:
+    except discord.NotFound:
         row = await ensure_challenge_message(row)
         if not row.get("message_id"):
             return
@@ -733,6 +781,15 @@ async def edit_challenge_message(row: dict, progress_value: float):
             message = await channel.fetch_message(int(row["message_id"]))
         except Exception:
             return
+    except discord.Forbidden as e:
+        print(f"Cannot fetch challenge message for editing: {e}")
+        return
+    except discord.HTTPException as e:
+        print(f"HTTP error while fetching challenge message for editing: {e}")
+        return
+    except Exception as e:
+        print(f"Unexpected error while fetching challenge message for editing: {e}")
+        return
 
     start_dt, end_dt = get_current_challenge_window()
     content = build_challenge_message_content(
@@ -772,8 +829,10 @@ async def post_challenge_completion_message(row: dict, progress_value: float):
 async def finalize_old_challenges():
     current = get_current_challenge_row()
     current_start = None
+    current_channel = None
     if current:
         current_start = current["week_start_date"]
+        current_channel = current["channel_id"]
 
     cursor.execute("""
     SELECT id, week_start_date, week_end_date, challenge_type, target_value,
@@ -786,7 +845,12 @@ async def finalize_old_challenges():
 
     for raw in rows:
         row = challenge_row_to_dict(raw)
-        if current_start is not None and row["week_start_date"] == current_start:
+        if (
+            current_start is not None
+            and current_channel is not None
+            and row["week_start_date"] == current_start
+            and row["channel_id"] == current_channel
+        ):
             continue
         if row["final_progress"] is not None:
             continue
@@ -813,70 +877,70 @@ async def ensure_current_group_challenge():
     week_start_date, week_end_date = get_period_dates_from_window(start_dt, end_dt)
 
     row = get_current_challenge_row()
-    if row:
-        return await ensure_challenge_message(row)
+    if not row:
+        challenge_type = get_next_challenge_type()
+        target_value = calculate_new_challenge_target(challenge_type)
 
-    challenge_type = get_next_challenge_type()
-    target_value = calculate_new_challenge_target(challenge_type)
-    challenge_id = create_group_challenge_row(
-        str(week_start_date),
-        str(week_end_date),
-        challenge_type,
-        target_value,
-        CHALLENGE_CHANNEL_ID
-    )
+        challenge_id = create_group_challenge_row(
+            str(week_start_date),
+            str(week_end_date),
+            challenge_type,
+            target_value,
+            CHALLENGE_CHANNEL_ID
+        )
 
-    cursor.execute("""
-    SELECT id, week_start_date, week_end_date, challenge_type, target_value,
-           current_progress, final_progress, channel_id, message_id,
-           milestone_posted, completed, completion_message_sent
-    FROM group_challenges
-    WHERE id=?
-    """, (challenge_id,))
-    row = challenge_row_to_dict(cursor.fetchone())
+        if challenge_id is None:
+            return None
+
+        row = get_group_challenge_row_by_id(challenge_id)
+
+    if not row:
+        return None
+
     return await ensure_challenge_message(row)
 
 
 async def process_group_challenge():
-    row = await ensure_current_group_challenge()
-    if not row:
-        return
+    async with challenge_lock:
+        row = await ensure_current_group_challenge()
+        if not row:
+            return
 
-    progress = compute_challenge_progress(
-        row["challenge_type"],
-        date.fromisoformat(row["week_start_date"]),
-        date.fromisoformat(row["week_end_date"]),
-        include_live_current=True
-    )
+        progress = compute_challenge_progress(
+            row["challenge_type"],
+            date.fromisoformat(row["week_start_date"]),
+            date.fromisoformat(row["week_end_date"]),
+            include_live_current=True
+        )
 
-    target = float(row["target_value"] or 0)
-    percent = int((progress / target) * 100) if target > 0 else 0
-    percent = min(100, max(0, percent))
-    milestone = (percent // CHALLENGE_MILESTONE_STEP) * CHALLENGE_MILESTONE_STEP
+        target = float(row["target_value"] or 0)
+        percent = int((progress / target) * 100) if target > 0 else 0
+        percent = min(100, max(0, percent))
+        milestone = (percent // CHALLENGE_MILESTONE_STEP) * CHALLENGE_MILESTONE_STEP
 
-    updates = {"current_progress": progress}
+        updates = {"current_progress": progress}
 
-    if int(row.get("completed") or 0) == 0 and progress >= target:
-        updates["completed"] = 1
-        updates["final_progress"] = progress
-        updates["milestone_posted"] = 100
-        update_group_challenge_row(row["id"], **updates)
-        row.update(updates)
+        if int(row.get("completed") or 0) == 0 and progress >= target:
+            updates["completed"] = 1
+            updates["final_progress"] = progress
+            updates["milestone_posted"] = 100
+            update_group_challenge_row(row["id"], **updates)
+            row.update(updates)
 
-        await edit_challenge_message(row, progress)
+            await edit_challenge_message(row, progress)
 
-        if int(row.get("completion_message_sent") or 0) == 0:
-            await post_challenge_completion_message(row, progress)
-            update_group_challenge_row(row["id"], completion_message_sent=1)
-        return
+            if int(row.get("completion_message_sent") or 0) == 0:
+                await post_challenge_completion_message(row, progress)
+                update_group_challenge_row(row["id"], completion_message_sent=1)
+            return
 
-    if milestone > int(row.get("milestone_posted") or 0):
-        updates["milestone_posted"] = milestone
-        update_group_challenge_row(row["id"], **updates)
-        row.update(updates)
-        await edit_challenge_message(row, progress)
-    else:
-        update_group_challenge_row(row["id"], **updates)
+        if milestone > int(row.get("milestone_posted") or 0):
+            updates["milestone_posted"] = milestone
+            update_group_challenge_row(row["id"], **updates)
+            row.update(updates)
+            await edit_challenge_message(row, progress)
+        else:
+            update_group_challenge_row(row["id"], **updates)
 
 # ================= DAILY ROLLOVER =================
 
@@ -1679,12 +1743,40 @@ async def daily_rollover_checker():
 async def group_challenge_checker():
     await process_group_challenge()
 
+
+@goal_checker.before_loop
+async def before_goal_checker():
+    await bot.wait_until_ready()
+
+
+@reminder_checker.before_loop
+async def before_reminder_checker():
+    await bot.wait_until_ready()
+
+
+@daily_rollover_checker.before_loop
+async def before_daily_rollover_checker():
+    await bot.wait_until_ready()
+
+
+@group_challenge_checker.before_loop
+async def before_group_challenge_checker():
+    await bot.wait_until_ready()
+
 # ================= EVENTS =================
 
 @bot.event
 async def on_ready():
+    global startup_complete
+
     print("Bot ready")
     print(f"Using database at: {DB_PATH}")
+
+    if startup_complete:
+        print("Reconnect detected - startup logic skipped.")
+        return
+
+    startup_complete = True
 
     await process_daily_rollover(send_messages=True)
     await process_group_challenge()

@@ -1052,6 +1052,9 @@ async def action_stand(user: discord.User | discord.Member):
     row = get_user(user_id)
     now = local_now()
 
+    if row["status"] == "standing":
+        return f"{user.mention} is already **standing**."
+
     if row["status"] == "seated":
         prev = datetime.fromisoformat(row["prev_timestamp"])
         elapsed = (now - prev).total_seconds()
@@ -1081,6 +1084,9 @@ async def action_sit(user: discord.User | discord.Member):
     mark_user_active(user_id)
     row = get_user(user_id)
     now = local_now()
+
+    if row["status"] == "seated":
+        return f"{user.mention} is already **sitting**."
 
     if row["status"] == "standing":
         prev = datetime.fromisoformat(row["prev_timestamp"])

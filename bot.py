@@ -148,6 +148,8 @@ RECOMMENDED_SIT_REMINDER_MIN = 30
 RECOMMENDED_STAND_REMINDER_MIN = 30
 
 MENU_TIMEOUT_SECONDS = 7200
+INACTIVITY_RESET_SECONDS = 10800  # 3 hours
+WEEKLY_TREND_EQUAL_MARGIN_SEC = 10 * 60  # 10 minutes
 
 STREAK_FREEZE_MESSAGE = (
     "You missed your goal today, but your streak is protected this time. 🔥\n"
@@ -597,6 +599,64 @@ def calculate_new_challenge_target(challenge_type: str) -> float:
 
     rounded = round_metric_target(challenge_type, raw_target)
     return clamp_metric_target(challenge_type, rounded)
+
+
+def get_user_standing_for_date_range(user_id: int, start_date: date, end_date: date) -> float:
+    cursor.execute("""
+    SELECT COALESCE(SUM(standing_sec), 0)
+    FROM daily_metrics
+    WHERE user_id=? AND metric_date >= ? AND metric_date <= ?
+    """, (user_id, str(start_date), str(end_date)))
+    return float(cursor.fetchone()[0] or 0)
+
+
+def get_recent_completed_tracking_weeks(user_id: int, limit: int = 2, max_weeks_to_scan: int = 52) -> list[dict]:
+    """
+    Returns the most recent completed Wed–Tue weeks with > 0 standing time.
+    Excludes the current in-progress week.
+    """
+    current_start_dt, _ = get_current_challenge_window()
+    latest_completed_week_end = current_start_dt.date() - timedelta(days=1)
+
+    weeks = []
+    week_end = latest_completed_week_end
+
+    for _ in range(max_weeks_to_scan):
+        week_start = week_end - timedelta(days=6)
+        standing_sec = get_user_standing_for_date_range(user_id, week_start, week_end)
+
+        if standing_sec > 0:
+            weeks.append({
+                "start_date": week_start,
+                "end_date": week_end,
+                "standing_sec": standing_sec
+            })
+            if len(weeks) >= limit:
+                break
+
+        week_end = week_end - timedelta(days=7)
+
+    return weeks
+
+
+def get_weekly_trend_text(user_id: int) -> str:
+    tracked_weeks = get_recent_completed_tracking_weeks(user_id=user_id, limit=2)
+
+    if len(tracked_weeks) < 2:
+        return "Weekly trend (Wed–Tue): **not enough data yet**"
+
+    latest_week = tracked_weeks[0]
+    previous_week = tracked_weeks[1]
+
+    diff_sec = float(latest_week["standing_sec"]) - float(previous_week["standing_sec"])
+
+    if abs(diff_sec) <= WEEKLY_TREND_EQUAL_MARGIN_SEC:
+        return "Weekly trend (Wed–Tue): Your standing time last week was **about the same** as your previous tracked week ➖"
+
+    if diff_sec > 0:
+        return f"Weekly trend (Wed–Tue): Your stainding time last week was **{format_time(diff_sec)}** more than your previous tracked week 📈"
+
+    return f"Weekly trend (Wed–Tue): Your standing time last week was **{format_time(abs(diff_sec))} below** your previous tracked week 🌱"
 
 
 async def get_channel_async(channel_id: int):
@@ -1202,7 +1262,8 @@ async def action_daily(user: discord.User | discord.Member):
 async def action_overview(user: discord.User | discord.Member):
     status_text = await action_status(user)
     daily_text = await action_daily(user)
-    return f"{status_text}\n\n{daily_text}"
+    weekly_trend_text = get_weekly_trend_text(user.id)
+    return f"{status_text}\n\n{daily_text}\n\n{weekly_trend_text}"
 
 
 async def action_reminder_info(user: discord.User | discord.Member):
@@ -1741,6 +1802,45 @@ async def reminder_checker():
 
 
 @tasks.loop(minutes=1)
+async def inactivity_checker():
+    user_ids = [r[0] for r in cursor.execute("SELECT user_id FROM users").fetchall()]
+    now = local_now()
+
+    for user_id in user_ids:
+        data = get_user(user_id)
+        if not data:
+            continue
+
+        if data.get("status") not in ("standing", "seated"):
+            continue
+
+        prev = datetime.fromisoformat(data["prev_timestamp"])
+        elapsed = (now - prev).total_seconds()
+
+        if elapsed < INACTIVITY_RESET_SECONDS:
+            continue
+
+        if data["status"] == "standing":
+            upsert_user(
+                user_id,
+                total_standing=float(data.get("total_standing") or 0) + elapsed,
+                prev_timestamp=now.isoformat(),
+                status="inactive",
+                last_reminder_session_start=None,
+                last_stand_reminder_session_start=None
+            )
+        else:
+            upsert_user(
+                user_id,
+                total_seated=float(data.get("total_seated") or 0) + elapsed,
+                prev_timestamp=now.isoformat(),
+                status="inactive",
+                last_reminder_session_start=None,
+                last_stand_reminder_session_start=None
+            )
+
+
+@tasks.loop(minutes=1)
 async def daily_rollover_checker():
     await process_daily_rollover(send_messages=True)
 
@@ -1757,6 +1857,11 @@ async def before_goal_checker():
 
 @reminder_checker.before_loop
 async def before_reminder_checker():
+    await bot.wait_until_ready()
+
+
+@inactivity_checker.before_loop
+async def before_inactivity_checker():
     await bot.wait_until_ready()
 
 
@@ -1792,6 +1897,9 @@ async def on_ready():
 
     if not reminder_checker.is_running():
         reminder_checker.start()
+
+    if not inactivity_checker.is_running():
+        inactivity_checker.start()
 
     if not daily_rollover_checker.is_running():
         daily_rollover_checker.start()

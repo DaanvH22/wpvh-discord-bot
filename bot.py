@@ -165,6 +165,7 @@ CHALLENGE_CHANNEL_ID = 1481603472867721318
 CHALLENGE_START_WEEKDAY = 2  # Wednesday (Mon=0)
 CHALLENGE_START_TIME = time(9, 30)
 CHALLENGE_MILESTONE_STEP = 10
+CHALLENGE_PROGRESS_EDIT_STEP = 1
 CHALLENGE_GROWTH_FACTOR = 1.10
 CHALLENGE_HISTORY_WEEKS = 3
 
@@ -659,6 +660,13 @@ def get_weekly_trend_text(user_id: int) -> str:
     return f"Weekly trend (Wed–Tue): Your standing time last week was **{format_time(abs(diff_sec))} below** your previous tracked week 🌱"
 
 
+def get_challenge_percent(progress_value: float, target_value: float) -> int:
+    if target_value <= 0:
+        return 0
+    percent = int((progress_value / target_value) * 100)
+    return min(100, max(0, percent))
+
+
 async def get_channel_async(channel_id: int):
     channel = bot.get_channel(channel_id)
     if channel is None:
@@ -748,8 +756,7 @@ def create_group_challenge_row(week_start_date: str, week_end_date: str, challen
 
 
 def build_challenge_message_content(challenge_type: str, target_value: float, progress_value: float, start_dt: datetime, end_dt: datetime) -> str:
-    percent = int((progress_value / target_value) * 100) if target_value > 0 else 0
-    percent = min(100, max(0, percent))
+    percent = get_challenge_percent(progress_value, target_value)
     label = CHALLENGE_CONFIG[challenge_type]["label"]
     progress_text = get_metric_value_text(challenge_type, progress_value)
     target_text = get_metric_value_text(challenge_type, target_value)
@@ -974,9 +981,12 @@ async def process_group_challenge():
         )
 
         target = float(row["target_value"] or 0)
-        percent = int((progress / target) * 100) if target > 0 else 0
-        percent = min(100, max(0, percent))
-        milestone = (percent // CHALLENGE_MILESTONE_STEP) * CHALLENGE_MILESTONE_STEP
+        current_percent = get_challenge_percent(progress, target)
+        previous_progress = float(row.get("current_progress") or 0)
+        previous_percent = get_challenge_percent(previous_progress, target)
+
+        milestone = (current_percent // CHALLENGE_MILESTONE_STEP) * CHALLENGE_MILESTONE_STEP
+        previous_milestone = int(row.get("milestone_posted") or 0)
 
         updates = {"current_progress": progress}
 
@@ -994,13 +1004,22 @@ async def process_group_challenge():
                 update_group_challenge_row(row["id"], completion_message_sent=1)
             return
 
-        if milestone > int(row.get("milestone_posted") or 0):
+        should_edit_message = False
+
+        # Edit the message whenever the displayed percent changes by at least 1%
+        if current_percent != previous_percent:
+            if abs(current_percent - previous_percent) >= CHALLENGE_PROGRESS_EDIT_STEP:
+                should_edit_message = True
+
+        # Keep milestone tracking for the motivational text thresholds/logical state
+        if milestone > previous_milestone:
             updates["milestone_posted"] = milestone
-            update_group_challenge_row(row["id"], **updates)
-            row.update(updates)
+
+        update_group_challenge_row(row["id"], **updates)
+        row.update(updates)
+
+        if should_edit_message or milestone > previous_milestone:
             await edit_challenge_message(row, progress)
-        else:
-            update_group_challenge_row(row["id"], **updates)
 
 # ================= DAILY ROLLOVER =================
 
